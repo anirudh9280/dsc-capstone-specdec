@@ -69,7 +69,7 @@ change matters more than the ratios: **latency scales with weight bytes again**,
 and the 4B reaches 76.6% of its bandwidth ceiling. For the target model the
 memory-bound premise now holds.
 
-`mode="reduce-overhead"` (CUDA graphs) does **not** work on this stack — see §5.
+`mode="reduce-overhead"` (CUDA graphs) does **not** work on this stack — see §7.
 
 ## 3. The pair ratio was the next bottleneck
 
@@ -87,27 +87,131 @@ the systems fix removed what was hiding it.
 
 ## 4. Acceptance length on MATH-500
 
-*[TABLE PENDING — full sweep running: Qwen3-4B / Qwen3-0.6B, 25 problems,
-γ ∈ {1,2,3,4,5,6,8}, 512 max new tokens, greedy]*
+Qwen3-4B target / Qwen3-0.6B draft, 25 problems, 512 max new tokens, greedy,
+1868 rounds at γ=8.
 
-Preliminary, on the 1.7B / 0.6B pair (3 problems, 128 tokens):
+| γ | acceptance length | of max | c (eager) | analytic | **measured** | projected @ c=0.441 |
+|---|---|---|---|---|---|---|
+| 1 | 1.903 | 2 | 0.859 | 1.020× | **1.032×** | 1.321× |
+| 2 | 2.773 | 3 | 0.911 | 0.966× | **0.894×** | 1.473× |
+| 3 | 3.453 | 4 | 0.842 | 0.973× | **0.897×** | 1.486× |
+| 4 | 4.187 | 5 | 0.858 | 0.912× | **0.860×** | **1.515×** |
+| 5 | 4.778 | 6 | 0.854 | 0.897× | **0.850×** | 1.491× |
+| 6 | 5.222 | 7 | 0.862 | 0.853× | **0.875×** | 1.432× |
+| 8 | 6.229 | 9 | 0.884 | 0.754× | **0.738×** | 1.376× |
 
-| γ | acceptance length | of max | 
-|---|---|---|
-| 2 | 2.783 | 3 |
-| 4 | 4.194 | 5 |
+**The analytic formula predicts the measured speedup.** 1.020 vs 1.032 at γ=1,
+0.912 vs 0.860 at γ=4, 0.754 vs 0.738 at γ=8 — agreement within a few percent
+across the whole sweep. That is the strongest evidence the harness is sound: the
+cost model, the acceptance accounting, and the wall clock all agree independently.
 
-93% of theoretical maximum at γ=2. Draft and target share a family and tokenizer,
-and MATH-500 contains long stretches of near-deterministic LaTeX, so the draft
-agrees often.
+The two trends behave exactly as theory says they should. Acceptance length rises
+monotonically (1.903 → 6.229) because a longer draft can only accept more. Speedup
+is **unimodal with a peak at γ=4**, because cost grows linearly in γ while
+acceptance saturates. That divergence is the whole argument for scheduling γ per
+position rather than fixing it.
 
 **Method note.** Acceptance length is a property of the model pair and the data —
 it only asks whether the draft's token matches the target's, so it is identical
 eager or compiled. `c` is *not* config-independent. I therefore measure acceptance
 wherever convenient, measure `c` under the configuration I intend to ship, and
-combine. Both inputs are recorded rather than folded into a single number.
+combine. Both inputs are recorded rather than folded into a single number. The
+`projected` column is the one to read for a compiled deployment.
 
-## 5. What does not work here
+## 5. How much room does adaptive γ actually have?
+
+A static-γ round always pays γ draft steps, because all γ proposals are generated
+before the target verifies any. An oracle knowing the run would end at 2 would
+draft exactly 2. Both emit identical tokens — speculative decoding is lossless —
+so the oracle wins purely by not wasting draft compute.
+
+At γ=8, 1868 rounds, mean accepted run 4.889, **3.111 wasted draft steps per round**:
+
+| | static γ=8 | oracle | headroom |
+|---|---|---|---|
+| c = 0.884 (eager) | 0.730× | 1.107× | **1.517×** |
+| c = 0.441 (compiled) | 1.301× | 1.866× | **1.435×** |
+
+I expected the headroom to shrink substantially at lower `c` — wasted drafts are
+cheaper when drafting is cheap. It barely moves (1.517× → 1.435×). **Adaptive
+scheduling is worth doing in both regimes**, which partly answers a question I
+came in with.
+
+### The run-length distribution is bimodal, and that is the real finding
+
+```
+  0:   287 ######
+  1:   185 ####
+  2:   148 ###
+  3:   107 ##
+  4:    85 ##
+  5:    81 ##
+  6:    80 ##
+  7:    54 #
+  8:   841 ##################  <- censored at gamma
+```
+
+Rounds either fail immediately (287 accept nothing) or run to the γ ceiling (841
+of 1868, 45%). The middle is thin. This is the "easy region / hard region"
+structure the domain description hypothesised, and it is *why* adaptive γ has
+headroom: if run lengths were unimodal around 4, a static γ=4 would already be
+near-optimal and there would be little to schedule.
+
+Lag-1 autocorrelation of run length is **0.314** — recent history carries signal,
+so even a cheap history-based policy is plausible.
+
+**Caveat, and it is a real one: 45% of rounds are right-censored**, so the oracle
+above is a *lower bound*. I am re-running at γ=16 to tighten it.
+
+## 6. What a scheduler could condition on
+
+10160 scored drafted positions, 89.9% accepted. A scheduler must decide before the
+target verifies anything, so only draft-time information is admissible.
+
+| signal | AUC | mean given accepted | mean given rejected |
+|---|---|---|---|
+| draft top-1 margin | **0.928** | 0.866 | 0.297 |
+| draft entropy | **0.079** (0.921 inverted) | 0.266 | 1.343 |
+| position within round | 0.589 | 3.03 | 2.34 |
+
+Draft confidence is a **very strong** predictor — AUC 0.93 from a quantity already
+computed during drafting, requiring no extra forward pass. A scheduler that drafts
+deep while the margin is high and stops when it collapses looks immediately viable.
+
+### Acceptance by token class contradicted my prediction
+
+| class | acceptance | n |
+|---|---|---|
+| numeric | **98.6%** | 1330 |
+| whitespace | 96.1% | 1011 |
+| latex_cmd | 93.7% | 301 |
+| symbol | 91.9% | 3514 |
+| word | **83.4%** | 4004 |
+
+I predicted the opposite — that LaTeX scaffolding would be near-deterministic and
+the actual numbers hard, since the numeric answer is the "content." The data says
+numbers are the *easiest* class (98.6%) and prose is the *hardest* (83.4%).
+
+In hindsight the mechanism is clear: in a worked solution the numbers are largely
+forced by the preceding computation, or copied from the problem statement, or the
+continuation of a multi-digit token already begun. The prose has genuine stylistic
+freedom — many valid ways to phrase "substituting this into the equation" — and a
+0.6B and a 4B model make different choices among them.
+
+This matters for the track: it suggests acceptance is limited by *stylistic*
+divergence rather than *reasoning* divergence, which is a different problem and
+plausibly more tractable.
+
+### One statistical trap I nearly fell into
+
+Acceptance rises with depth into a round (84.6% at position 0 → 94.0% at position
+7). That reads as "drafting deeper is safer," and it is **survivorship bias**: a
+round only reaches depth 7 by having accepted 7 tokens, so deep positions are
+conditioned on being in an easy stretch. Note the shrinking n (1868 → 895). The
+unbiased per-depth curve needs a fixed-γ run with no early exit. I have flagged
+this in the script so the number is not quoted naively later.
+
+## 7. What does not work here
 
 **CUDA graphs.** Two distinct failures:
 
@@ -122,7 +226,7 @@ combine. Both inputs are recorded rather than folded into a single number.
 I stopped after two attempts rather than spend the week on it. This is the main
 thing I would like guidance on (§7).
 
-## 6. Correctness
+## 8. Correctness
 
 Speculative decoding is exactly lossless, which gives a binary test rather than a
 tolerance. `tests/test_lossless.py`:
@@ -151,7 +255,7 @@ Two of my own measurement errors, both caught and both recorded:
   observes at decision time. With the fix: mean entropy 0.171 for accepted vs
   0.796 for rejected tokens, a 4.6× separation.
 
-## 7. Questions
+## 9. Questions
 
 1. **CUDA graphs on Blackwell.** Does the group run `reduce-overhead` / cudagraphs
    on sm_120, and on what torch + transformers combination? The draft is still at
@@ -159,14 +263,20 @@ Two of my own measurement errors, both caught and both recorded:
    remaining headroom is concentrated exactly where graphs would help most — a
    small model whose per-step cost is dominated by fixed overhead.
 
-2. **Which regime is adaptive γ really for?** The oracle's advantage comes from not
-   wasting draft steps, so its headroom scales with `c`. At `c = 0.441` wasted
-   drafts are comparatively cheap and the ceiling may be modest, whereas at
-   `c ≈ 1` it was large but the method lost outright. Is the group's interest in
-   adaptive scheduling aimed at the high-`c` regime — EAGLE-style heads with tree
-   drafting, where many candidates are proposed per step — rather than a
-   small-independent-draft setup like mine? That changes what I should be
-   optimizing, and whether I should move to a draft head before studying γ.
+2. **Is the bimodality the thing to exploit, or an artifact of γ censoring?** I
+   came in expecting the oracle headroom to shrink at low `c` and it barely did
+   (1.517× → 1.435×), so adaptive γ looks worthwhile in both regimes — that part
+   I could answer myself. What I cannot answer is whether the run-length
+   distribution is *genuinely* bimodal or whether the mass at 8 is an artifact of
+   the ceiling. 45% of rounds are censored, and the γ=16 rerun will say. If it is
+   genuine, the right policy may be much simpler than a per-position regressor:
+   roughly a two-state classifier (easy stretch → draft deep; hard → draft
+   shallow or skip), which the 0.314 autocorrelation would also support. Is that
+   consistent with what DFlash found?
+
+   Related: acceptance is high enough here (89.9%) that I wonder whether MATH-500
+   at 512 tokens is discriminative enough, or whether I should be looking at
+   longer chains of thought where the draft has more room to drift.
 
 3. **Which lever has more room?** At 4B/0.6B, `c = 0.441` is still 3× the weight
    ratio (0.148), because the draft is overhead-bound rather than bandwidth-bound.

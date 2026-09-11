@@ -142,6 +142,14 @@ def main() -> int:
         rate = statistics.mean(by_pos[p])
         bar = "#" * max(1, round(40 * rate))
         print(f"    pos {p}: {rate * 100:>5.1f}%  n={len(by_pos[p]):<6} {bar}")
+    print()
+    print("  CAUTION -- this is survivorship-biased, not a within-round trend.")
+    print("  A round only reaches depth k by having accepted k tokens already, so")
+    print("  deep positions are conditioned on being in an easy stretch. Rising")
+    print("  acceptance with depth therefore does NOT mean drafting deeper is safer;")
+    print("  it means the rounds that got there were the predictable ones. Note the")
+    print("  shrinking n. Only a fixed-gamma-no-early-exit run would give the")
+    print("  unbiased per-depth curve.")
 
     tok_stats = None
     if args.tokenizer:
@@ -160,10 +168,25 @@ def main() -> int:
             tok_stats[cls] = {"rate": rate, "n": len(buckets[cls])}
             bar = "#" * max(1, round(40 * rate))
             print(f"    {cls:<12} {rate * 100:>5.1f}%  n={len(buckets[cls]):<6} {bar}")
-        print()
-        print("  If LaTeX/whitespace accept far more often than numeric tokens, a")
-        print("  scheduler keyed on token class alone would already capture much of")
-        print("  the available headroom -- and costs nothing to evaluate.")
+        if tok_stats:
+            best = max(tok_stats.items(), key=lambda kv: kv[1]["rate"])
+            worst = min(tok_stats.items(), key=lambda kv: kv[1]["rate"])
+            spread = best[1]["rate"] - worst[1]["rate"]
+            print()
+            print(f"  spread: {best[0]} {best[1]['rate'] * 100:.1f}% vs "
+                  f"{worst[0]} {worst[1]['rate'] * 100:.1f}%  ({spread * 100:.1f} pts)")
+            if spread > 0.10:
+                print("  Token class carries real signal and is free to compute, so it is a")
+                print("  plausible scheduler feature on its own.")
+            else:
+                print("  Token class barely separates; a scheduler should use the draft's")
+                print("  own distribution instead.")
+            print()
+            print("  Do not assume the direction. The natural guess -- that LaTeX")
+            print("  scaffolding is easy and numbers are hard -- is worth checking")
+            print("  against the table above rather than asserting, since a math")
+            print("  solution's numbers are often forced by the preceding computation")
+            print("  while its prose has genuine stylistic freedom.")
 
     out = os.path.join(rdir, f"signals_gamma{gamma}.json")
     with open(out, "w") as f:
