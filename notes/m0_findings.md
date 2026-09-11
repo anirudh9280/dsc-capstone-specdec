@@ -85,3 +85,68 @@ Triton JIT-compiles a C launcher stub; WSL has no `gcc`. Two paths:
 - `DynamicCache.crop()` does exist in 5.17, so the simpler dynamic-cache
   implementation remains available as a correctness reference to check the
   static-cache version against.
+
+---
+
+# Addendum — the launch-overhead fix (same day, after `build-essential`)
+
+With `gcc` installed, `torch.compile` runs. Two modes, very different outcomes.
+
+## `mode="reduce-overhead"` (CUDA graphs) — does not work here
+
+Two failures in sequence:
+
+1. With `DynamicCache`: `RuntimeError: accessing tensor output of CUDAGraphs that
+   has been overwritten by a subsequent run`. Graph trees reuse output buffers, and
+   `DynamicCache` *stores* tensors produced inside the graph, so a replay silently
+   clobbers the KV cache. This is the structural reason CUDA graphs need a
+   preallocated, in-place cache.
+2. With `StaticCache`: inductor logs `skipping cudagraphs due to mutated inputs
+   (84 instances)`, traced to `self.cumulative_length.add_()` in
+   `cache_utils.py:478` — StaticCache mutates its own buffers by design, which the
+   cudagraph pass refuses to capture. The process then **segfaults (exit 139)**
+   with no Python traceback.
+
+Treat cudagraphs as unavailable on this stack (torch 2.11 + transformers 5.17 +
+Qwen3 + sm_120) until proven otherwise. Not worth more time right now.
+
+## `mode="default"` (inductor fusion only) — works, and is a large win
+
+| config | ms/token | tok/s | % of measured-BW ceiling |
+|---|---|---|---|
+| Qwen3-0.6B eager | 20.93 | 47.8 | 7.6 |
+| Qwen3-0.6B compiled | **6.185** | **161.7** | **25.7** |
+| Qwen3-1.7B eager | 19.04 | 52.5 | 24.1 |
+| Qwen3-1.7B compiled | **7.354** | **136.0** | **62.5** |
+
+**3.4x on the draft, 2.6x on the target**, from kernel fusion alone — no CUDA
+graphs. Fusion cuts the number of launches, which is what the bottleneck was.
+
+The qualitative change matters more than the ratios: **latency now scales with
+model size again** (6.19 -> 7.35 ms), and the 1.7B sits at 62.5% of its bandwidth
+ceiling. The memory-bound premise is starting to hold for the target. The 0.6B at
+25.7% is still overhead-dominated, which is expected — fixed per-step cost is a
+larger share of a smaller model.
+
+## What this does to the cost model
+
+    c = 6.185 / 7.354 = 0.841      (was ~1.1 in eager)
+
+    gamma=4:  4.194 / (4*0.841 + 1) = 0.96x   still losing, barely
+    gamma=2:  2.783 / (2*0.841 + 1) = 1.04x   profitable
+
+So the systems fix moves speculative decoding from "cannot win at any gamma" to
+"wins at small gamma", and the unimodal speedup-vs-gamma curve predicted by theory
+starts to appear. Worth re-running the MATH-500 sweep compiled to see the whole
+curve rather than two points.
+
+## The remaining problem is the model pair, not the systems
+
+c = 0.841 is still far above the ~0.35 the weight ratio implies. The cause is now
+visible and is a *choice*, not a bug: **Qwen3-0.6B against Qwen3-1.7B is only a
+2.9x size ratio.** Production speculative decoding uses 10-30x (e.g. a 0.5B draft
+against a 7B-32B target). A draft that is a third the size of its target cannot be
+cheap enough, however fast the kernels are.
+
+Next: measure Qwen3-4B compiled and recompute c for a 4B/0.6B pair (6.7x ratio).
+That is the M3 model-pair decision, made from measurement rather than estimate.
