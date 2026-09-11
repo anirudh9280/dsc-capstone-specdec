@@ -150,3 +150,65 @@ cheap enough, however fast the kernels are.
 
 Next: measure Qwen3-4B compiled and recompute c for a 4B/0.6B pair (6.7x ratio).
 That is the M3 model-pair decision, made from measurement rather than estimate.
+
+---
+
+# M3 model-pair decision (measured, not estimated)
+
+Compiled (`--compile --compile-mode default`), clean GPU:
+
+| model | weights | ms/token | tok/s | % of measured-BW ceiling |
+|---|---|---|---|---|
+| Qwen3-0.6B | 1.19 GB | 6.185 | 161.7 | 25.7 |
+| Qwen3-1.7B | 3.44 GB | 7.354 | 136.0 | 62.5 |
+| Qwen3-4B | 8.04 GB | 14.026 | 71.3 | **76.6** |
+
+Latency now scales with weight bytes, and the 4B sits at **76.6% of its bandwidth
+ceiling** -- for the target model, the memory-bound premise finally holds. The
+0.6B at 25.7% is still overhead-dominated, which is exactly what you expect: a
+fixed per-step cost is a larger fraction of a smaller model.
+
+## Cost ratio across candidate pairs
+
+    target        draft        c = draft_ms / target_ms
+    Qwen3-1.7B    Qwen3-0.6B   6.185 / 7.354  = 0.841
+    Qwen3-4B      Qwen3-0.6B   6.185 / 14.026 = 0.441
+
+**Decision: Qwen3-4B target / Qwen3-0.6B draft.** VRAM 8.04 + 1.19 = 9.23 GB
+against 14.6 GB free, comfortable with both KV caches.
+
+Projected with the acceptance lengths measured on the 1.7B pair (which will be
+somewhat optimistic -- a 0.6B and a 4B diverge more than a 0.6B and a 1.7B, so
+acceptance should drop):
+
+    gamma=2:  2.783 / (2*0.441 + 1) = 1.48x
+    gamma=4:  4.194 / (4*0.441 + 1) = 1.52x
+
+A real speedup, pending the measured acceptance length for this pair.
+
+## Why this ordering of findings matters
+
+Each fix exposed the next bottleneck, which is the method Prof. Liu described:
+
+1. eager, 1.7B/0.6B  -> c ~ 1.1   -- host/launch bound; cannot win at any gamma
+2. compiled, 1.7B/0.6B -> c = 0.841 -- launch cost cut 3.4x; wins at small gamma
+3. compiled, 4B/0.6B  -> c = 0.441 -- pair ratio fixed; ~1.5x projected
+
+Note that steps 2 and 3 are different KINDS of intervention. Step 2 is a systems
+fix (kernel fusion). Step 3 is a configuration choice that was invisible until the
+systems fix removed the overhead masking it. In eager mode every pair looked
+equally bad, because fixed host cost dominated the weight-ratio signal entirely.
+
+## Methodological note on combining these numbers
+
+Acceptance length is a property of the model pair and the data -- it is identical
+eager or compiled, because it only asks how often the draft's token matches the
+target's. The cost ratio c is NOT config-independent. So the defensible procedure,
+and the one `--assume-cost-ratio` implements, is:
+
+  measure acceptance length wherever convenient; measure c under the configuration
+  you intend to ship; compute speedup from both.
+
+Reporting an eager-measured speedup would understate the method; reporting a
+compiled speedup against eager-measured acceptance without saying so would be
+sloppy. Both inputs are recorded in summary.json.

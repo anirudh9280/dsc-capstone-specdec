@@ -51,6 +51,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--baseline", action="store_true",
                     help="also time plain autoregressive decoding for a real speedup denominator")
+    ap.add_argument("--assume-cost-ratio", type=float, default=None,
+                    help="recompute speedup with an externally measured c. Acceptance length "
+                         "is a property of the model pair and is identical eager or compiled, "
+                         "but c is not -- so measure c under the config you intend to ship "
+                         "(bench/roofline.py --compile) and pass it here.")
     ap.add_argument("--out-dir", default=None)
     args = ap.parse_args()
 
@@ -147,6 +152,11 @@ def main() -> int:
             print(f"  measured speedup  : {measured_sp:.3f}x")
         print(f"  -> {path}")
 
+        projected = (med_acc / (gamma * args.assume_cost_ratio + 1)
+                     if args.assume_cost_ratio is not None else None)
+        if projected is not None:
+            print(f"  projected @ c={args.assume_cost_ratio:.3f} : {projected:.3f}x")
+
         summary.append({
             "gamma": gamma,
             "acceptance_length": med_acc,
@@ -154,6 +164,8 @@ def main() -> int:
             "cost_ratio": med_c,
             "analytic_speedup": med_sp,
             "measured_speedup": measured_sp,
+            "assumed_cost_ratio": args.assume_cost_ratio,
+            "projected_speedup": projected,
             "n_problems": len(id_batches),
         })
 
@@ -165,15 +177,17 @@ def main() -> int:
                    "sweep": summary}, f, indent=2)
 
     print()
-    print("=" * 70)
-    print(f"{'gamma':>6}{'accept_len':>13}{'of max':>9}{'c':>8}{'analytic':>11}{'measured':>11}")
-    print("=" * 70)
+    print("=" * 82)
+    print(f"{'gamma':>6}{'accept_len':>13}{'of max':>9}{'c':>8}"
+          f"{'analytic':>11}{'measured':>11}{'projected':>12}")
+    print("=" * 82)
     for row in summary:
         meas = f"{row['measured_speedup']:.3f}x" if row["measured_speedup"] else "--"
+        proj = f"{row['projected_speedup']:.3f}x" if row["projected_speedup"] else "--"
         print(f"{row['gamma']:>6}{row['acceptance_length']:>13.3f}"
               f"{row['max_possible']:>9}{row['cost_ratio']:>8.3f}"
-              f"{row['analytic_speedup']:>10.3f}x{meas:>11}")
-    print("=" * 70)
+              f"{row['analytic_speedup']:>10.3f}x{meas:>11}{proj:>12}")
+    print("=" * 82)
     print()
     print("Read the two trends against each other: acceptance length rises")
     print("monotonically with gamma, but speedup is unimodal and peaks earlier.")
