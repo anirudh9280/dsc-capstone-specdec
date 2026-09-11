@@ -63,23 +63,86 @@ def run_length_stats(rounds: list[dict], gamma: int) -> dict:
     }
 
 
-def speedups(rounds: list[dict], gamma: int, c: float) -> dict:
-    """Static-gamma vs oracle, both emitting the same tokens."""
+def speedups(rounds: list[dict], gamma: int, c: float,
+             sweep: list[dict] | None = None) -> dict:
+    """Static-gamma vs oracle, both emitting the same tokens.
+
+    Two different comparisons, and the distinction matters:
+
+    * vs static at THIS gamma -- inflated whenever the trace's gamma is a poor
+      choice, because a large static gamma wastes many draft steps. Reporting only
+      this number would overstate what adaptive scheduling buys.
+    * vs the BEST static gamma -- the honest baseline. Nobody would deploy a gamma
+      they had not tuned, so an adaptive scheduler has to beat the tuned constant,
+      not an arbitrary one.
+    """
     lengths = [r["n_accepted"] for r in rounds]
     mean_emit = statistics.mean([n + 1 for n in lengths])
 
     static_cost = gamma * c + 1.0          # always pays gamma drafts
     oracle_cost = statistics.mean([n * c + 1.0 for n in lengths])  # drafts exactly n
+    oracle_speedup = mean_emit / oracle_cost
 
-    return {
+    out = {
         "mean_emitted_per_round": mean_emit,
         "static_cost_per_round": static_cost,
         "oracle_cost_per_round": oracle_cost,
         "static_speedup": mean_emit / static_cost,
-        "oracle_speedup": mean_emit / oracle_cost,
-        "headroom_x": (mean_emit / oracle_cost) / (mean_emit / static_cost),
+        "oracle_speedup": oracle_speedup,
+        "headroom_vs_same_gamma": oracle_speedup / (mean_emit / static_cost),
         "wasted_draft_steps_per_round": gamma - statistics.mean(lengths),
     }
+
+    # Best tuned static gamma, from MEASURED per-gamma traces (see measured_curve()).
+    #
+    # Do not try to re-derive the static curve from a single large-gamma trace by
+    # averaging min(r, gamma')+1 over its rounds. That is biased LOW, and the bias
+    # is not small -- it gave 3.692 where the measured gamma=4 run gave 4.187.
+    # The reason: a long agreeing run becomes SEVERAL rounds at a smaller gamma'
+    # (a run of 10 is two rounds at gamma'=4), so long runs must be weighted by how
+    # many gamma'-rounds they produce. Averaging over the large-gamma round
+    # boundaries under-weights exactly the rounds that matter most.
+    #
+    # A fully exact re-derivation is not available at all: when every draft in a
+    # round is accepted, the bonus token comes from the target and was never tested
+    # against the draft, so the per-position agreement sequence has holes precisely
+    # at those positions. Measure each gamma instead; it is cheap.
+    if sweep:
+        best_g, best_sp = None, 0.0
+        for row in sweep:
+            g = row["gamma"]
+            sp_g = row["acceptance_length"] / (g * c + 1.0)
+            if sp_g > best_sp:
+                best_g, best_sp = g, sp_g
+        out["best_static_gamma"] = best_g
+        out["best_static_speedup"] = best_sp
+        out["headroom_vs_best_static"] = oracle_speedup / best_sp if best_sp else None
+    return out
+
+
+def measured_curve(rdir: str, c: float) -> list[dict]:
+    """Measured acceptance length per gamma, read from each gamma's own trace.
+
+    Read from the JSONL files rather than summary.json, which a later
+    single-gamma run overwrites -- that silently made gamma=16 look like the best
+    static choice when the full sweep had already shown gamma=3.
+    """
+    rows = []
+    for fn in sorted(os.listdir(rdir)):
+        if not (fn.startswith("gamma") and fn.endswith(".jsonl")):
+            continue
+        g = int(fn[5:-6])
+        emitted = rounds = 0
+        with open(os.path.join(rdir, fn)) as fh:
+            for line in fh:
+                rec = json.loads(line)
+                emitted += rec["n_generated"]
+                rounds += rec["n_rounds"]
+        if rounds:
+            acc = emitted / rounds
+            rows.append({"gamma": g, "acceptance_length": acc,
+                         "speedup": acc / (g * c + 1.0)})
+    return sorted(rows, key=lambda r: r["gamma"])
 
 
 def burstiness(rounds: list[dict]) -> dict:
@@ -132,7 +195,8 @@ def main() -> int:
     c = args.cost_ratio if args.cost_ratio is not None else (row["cost_ratio"] if row else 1.0)
 
     rl = run_length_stats(rounds, gamma)
-    sp = speedups(rounds, gamma, c)
+    curve = measured_curve(rdir, c)
+    sp = speedups(rounds, gamma, c, curve)
     bz = burstiness(rounds)
 
     print("=" * 68)
@@ -158,9 +222,22 @@ def main() -> int:
     print(f"  static cost/round          {sp['static_cost_per_round']:.3f}")
     print(f"  oracle cost/round          {sp['oracle_cost_per_round']:.3f}")
     print("-" * 68)
+    print(f"  measured static-gamma curve at c={c:.3f} (one run per gamma):")
+    for row in curve:
+        star = "  <- best" if row["gamma"] == sp.get("best_static_gamma") else ""
+        print(f"    gamma={row['gamma']:>2}: accept_len {row['acceptance_length']:>6.3f}   "
+              f"speedup {row['speedup']:.3f}x{star}")
+    print("-" * 68)
     print(f"  static gamma={gamma} speedup     {sp['static_speedup']:.3f}x")
+    print(f"  best static (gamma={sp['best_static_gamma']})       "
+          f"{sp['best_static_speedup']:.3f}x")
     print(f"  ORACLE speedup             {sp['oracle_speedup']:.3f}x")
-    print(f"  HEADROOM                   {sp['headroom_x']:.3f}x")
+    print("-" * 68)
+    print(f"  headroom vs same gamma     {sp['headroom_vs_same_gamma']:.3f}x   "
+          f"(inflated if gamma={gamma} is a poor choice)")
+    if sp.get("headroom_vs_best_static") is not None:
+        print(f"  HEADROOM vs BEST STATIC    {sp['headroom_vs_best_static']:.3f}x   "
+              f"<- the honest number")
     print("=" * 68)
     print()
     print(f"  lag-1 autocorrelation of run length: {bz['lag1_autocorr']}")
@@ -173,9 +250,15 @@ def main() -> int:
             print("    Run lengths are autocorrelated: recent history carries signal,")
             print("    so a cheap history-based scheduler is worth trying.")
     print()
-    print(f"  Interpretation: an adaptive scheduler can win at most {sp['headroom_x']:.2f}x")
-    print(f"  over static gamma={gamma} here, by not wasting "
+    hr = sp.get("headroom_vs_best_static") or sp["headroom_vs_same_gamma"]
+    against = (f"the best TUNED static gamma={sp['best_static_gamma']}"
+               if sp.get("best_static_gamma") is not None else f"static gamma={gamma}")
+    print(f"  Interpretation: a perfect scheduler wins at most {hr:.2f}x over")
+    print(f"  {against}, by not wasting "
           f"{sp['wasted_draft_steps_per_round']:.1f} draft steps per round.")
+    print("  Quote this against the tuned baseline, not against the trace's own")
+    print("  gamma -- nobody deploys an untuned constant, so beating one is not")
+    print("  evidence that adaptive scheduling is worthwhile.")
 
     out = os.path.join(rdir, f"oracle_gamma{gamma}.json")
     with open(out, "w") as f:

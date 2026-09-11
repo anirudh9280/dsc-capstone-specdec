@@ -169,12 +169,23 @@ def main() -> int:
             "n_problems": len(id_batches),
         })
 
+    # Merge rather than overwrite. A later single-gamma run used to clobber the
+    # whole sweep, which silently made gamma=16 look like the best static choice
+    # when the full sweep had already shown gamma=3.
     spath = os.path.join(out_dir, "summary.json")
+    merged = {row["gamma"]: row for row in summary}
+    if os.path.exists(spath):
+        try:
+            prev = json.load(open(spath))
+            for row in prev.get("sweep", []):
+                merged.setdefault(row["gamma"], row)
+        except (json.JSONDecodeError, OSError):
+            pass  # unreadable previous summary: just write the fresh one
     with open(spath, "w") as f:
         json.dump({"target": args.target, "draft": args.draft,
                    "temperature": args.temperature,
                    "max_new_tokens": args.max_new_tokens,
-                   "sweep": summary}, f, indent=2)
+                   "sweep": [merged[g] for g in sorted(merged)]}, f, indent=2)
 
     print()
     print("=" * 82)

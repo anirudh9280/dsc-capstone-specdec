@@ -125,43 +125,76 @@ before the target verifies any. An oracle knowing the run would end at 2 would
 draft exactly 2. Both emit identical tokens — speculative decoding is lossless —
 so the oracle wins purely by not wasting draft compute.
 
-At γ=8, 1868 rounds, mean accepted run 4.889, **3.111 wasted draft steps per round**:
+From the γ=16 trace (1407 rounds, 22.9% censored), at c = 0.441:
 
-| | static γ=8 | oracle | headroom |
-|---|---|---|---|
-| c = 0.884 (eager) | 0.730× | 1.107× | **1.517×** |
-| c = 0.441 (compiled) | 1.301× | 1.866× | **1.435×** |
+| | speedup |
+|---|---|
+| static γ=16 (untuned) | 0.966× |
+| **best tuned static, γ=3** | **1.454×** |
+| oracle | **1.950×** |
+| headroom vs best tuned static | **1.341×** |
 
-I expected the headroom to shrink substantially at lower `c` — wasted drafts are
-cheaper when drafting is cheap. It barely moves (1.517× → 1.435×). **Adaptive
-scheduling is worth doing in both regimes**, which partly answers a question I
-came in with.
+**1.34× is the number to quote.** A perfect scheduler beats the best *tuned*
+constant by 34%, by not wasting 9.2 draft steps per round.
 
-### The run-length distribution is bimodal, and that is the real finding
+My first version of this analysis reported **2.019×**, comparing the oracle to
+static γ=16 — the trace's own γ, which is a terrible choice (it loses outright at
+0.966×). Beating an untuned constant is not evidence that scheduling helps. The
+script now derives the tuned baseline and labels the inflated comparison as such.
+
+Headroom is also insensitive to `c`: 1.517× at c=0.884 vs 1.435× at c=0.441 on the
+γ=8 trace. I had expected it to collapse once drafting got cheap. It does not, so
+adaptive scheduling is worth pursuing in both regimes — a question I came in with
+and could answer from the data.
+
+### The distribution is heavy-tailed, not bimodal — I got this wrong first
+
+At γ=8 the histogram looked strikingly bimodal: 287 rounds accepting nothing, 841
+of 1868 (45%) pinned at the ceiling, a thin middle. I wrote that up as the "easy
+region / hard region" structure the domain description hypothesises.
+
+Doubling to γ=16 shows most of that was an artifact of the ceiling:
 
 ```
-  0:   287 ######
-  1:   185 ####
-  2:   148 ###
-  3:   107 ##
-  4:    85 ##
-  5:    81 ##
-  6:    80 ##
-  7:    54 #
-  8:   841 ##################  <- censored at gamma
+ γ=8:   287, 185, 148, 107, 85, 81, 80, 54, [841 censored]
+ γ=16:  253, 160, 123, 103, 74, 57, 49, 46, 36, 36, 24, 23, 19, 35, 28, 20, [322]
 ```
 
-Rounds either fail immediately (287 accept nothing) or run to the γ ceiling (841
-of 1868, 45%). The middle is thin. This is the "easy region / hard region"
-structure the domain description hypothesised, and it is *why* adaptive γ has
-headroom: if run lengths were unimodal around 4, a static γ=4 would already be
-near-optimal and there would be little to schedule.
+The true distribution decays smoothly and monotonically with a long tail. Censoring
+falls 45% → 22.9%; the spike simply moves to whatever γ you impose. Mean run 6.778,
+median 4.0.
 
-Lag-1 autocorrelation of run length is **0.314** — recent history carries signal,
-so even a cheap history-based policy is plausible.
+This still supports adaptive scheduling — a heavy tail means a single γ is wrong
+for most rounds, and lag-1 autocorrelation is **0.276**, so recent history carries
+signal. But the mechanism is "run lengths vary a lot and are somewhat predictable,"
+not "there are two discrete regimes." A two-state easy/hard classifier, which is
+what I would have built from the γ=8 picture, is the wrong model.
 
-**Caveat, and it is a real one: 45% of rounds are right-censored**, so the oracle
-above is a *lower bound*. I am re-running at γ=16 to tighten it.
+**22.9% is still censored**, so 1.950× remains a lower bound on the oracle.
+
+### A derivation that looked exact and was not
+
+I first tried to recover the whole static-γ curve from the single γ=16 trace,
+reasoning that losslessness fixes the emitted sequence, so a round with run length
+`r` would emit `min(r, γ′)+1` at any γ′ — and that censoring is harmless since
+`min(r, γ′) = γ′` whenever `r ≥ 16 ≥ γ′`.
+
+It is biased low, and not slightly: it gave 3.692 at γ=4 where the measured run
+gave 4.187. The flaw is the weighting. A long agreeing run becomes *several* rounds
+at a smaller γ′ — a run of 10 is two rounds at γ′=4 — so it must count once per
+round it produces. Averaging over the large-γ round boundaries under-weights
+precisely the rounds that dominate throughput.
+
+Worse, no exact re-derivation exists: when every draft in a round is accepted the
+bonus token comes from the *target* and was never tested against the draft, so the
+per-position agreement sequence has holes exactly at those positions.
+
+The measured discrepancy is what caught it. Measuring each γ directly is cheap;
+the analysis now reads acceptance from each γ's own trace file.
+
+*(Those measured acceptance lengths — 1.896, 2.707, 3.378, 3.996 — are pooled
+means, total emitted over total rounds. The §4 table reports medians of per-problem
+values, hence the small differences.)*
 
 ## 6. What a scheduler could condition on
 
@@ -263,20 +296,20 @@ Two of my own measurement errors, both caught and both recorded:
    remaining headroom is concentrated exactly where graphs would help most — a
    small model whose per-step cost is dominated by fixed overhead.
 
-2. **Is the bimodality the thing to exploit, or an artifact of γ censoring?** I
-   came in expecting the oracle headroom to shrink at low `c` and it barely did
-   (1.517× → 1.435×), so adaptive γ looks worthwhile in both regimes — that part
-   I could answer myself. What I cannot answer is whether the run-length
-   distribution is *genuinely* bimodal or whether the mass at 8 is an artifact of
-   the ceiling. 45% of rounds are censored, and the γ=16 rerun will say. If it is
-   genuine, the right policy may be much simpler than a per-position regressor:
-   roughly a two-state classifier (easy stretch → draft deep; hard → draft
-   shallow or skip), which the 0.314 autocorrelation would also support. Is that
-   consistent with what DFlash found?
+2. **Is 1.34× worth a quarter?** That is the oracle headroom over the best tuned
+   static γ — the ceiling for *any* scheduler, with perfect foresight and zero
+   inference cost. A real scheduler pays for its own decisions and mispredicts, so
+   a plausible realised fraction might be half of that. Is ~1.15–1.2× the kind of
+   result the group considers worth pursuing, or is that inside the noise of what
+   a better draft model would give for less effort? I would rather know this before
+   spending Q1 on it than after.
 
-   Related: acceptance is high enough here (89.9%) that I wonder whether MATH-500
-   at 512 tokens is discriminative enough, or whether I should be looking at
-   longer chains of thought where the draft has more room to drift.
+   Two things that could change the answer: 22.9% of rounds are still censored at
+   γ=16, so 1.950× is a lower bound on the oracle; and acceptance here is high
+   (89.9%), which makes me suspect MATH-500 at 512 tokens may not be the most
+   discriminative setting. Longer chains of thought, where the draft has room to
+   drift, would likely show more headroom — and are closer to the regime the domain
+   description mentions for quantization error accumulating over long reasoning.
 
 3. **Which lever has more room?** At 4B/0.6B, `c = 0.441` is still 3× the weight
    ratio (0.148), because the draft is overhead-bound rather than bandwidth-bound.
