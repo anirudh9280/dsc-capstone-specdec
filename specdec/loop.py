@@ -208,12 +208,23 @@ def speculative_generate(
         q_dists: list[torch.Tensor] = []
         torch.cuda.synchronize()
         d_t0 = time.perf_counter()
+        raw_ents: list[float] = []
+        raw_margins: list[float] = []
         for _ in range(cfg.gamma):
             inp = torch.tensor([tokens[d_cached:]], device=device)
             out = draft(input_ids=inp, past_key_values=draft_cache, use_cache=True)
             d_cached = len(tokens)
-            q = _distribution(out.logits[0, -1], cfg.temperature)
+            logits = out.logits[0, -1]
+            q = _distribution(logits, cfg.temperature)
             q_dists.append(q)
+            # Confidence telemetry must come from the RAW softmax, never from `q`:
+            # under greedy `q` is one-hot, so its entropy is identically 0 and its
+            # top-1 margin identically 1, which would silently destroy the very
+            # features an adaptive-gamma scheduler would condition on (M4). The raw
+            # distribution is also what a real scheduler sees at decision time.
+            raw = torch.softmax(logits.float(), dim=-1)
+            raw_ents.append(_entropy(raw))
+            raw_margins.append(_top1_margin(raw))
             tokens.append(_sample(q, gen))
         torch.cuda.synchronize()
         draft_ms = (time.perf_counter() - d_t0) * 1000.0
@@ -243,8 +254,8 @@ def speculative_generate(
             p_x = float(p_dists[i][x])
             q_of.append(q_x)
             p_of.append(p_x)
-            ents.append(_entropy(q_dists[i]))
-            margins.append(_top1_margin(q_dists[i]))
+            ents.append(raw_ents[i])
+            margins.append(raw_margins[i])
 
             if cfg.temperature <= 0.0:
                 accept = x == int(p_dists[i].argmax())
