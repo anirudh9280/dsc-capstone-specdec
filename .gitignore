@@ -1,0 +1,27 @@
+# Big artifacts: traces live on ext4 ($SPECDEC_RESULTS), never in OneDrive sync.
+results/**/*.jsonl
+results/**/*.pt
+results/**/*.npz
+*.nsys-rep
+*.sqlite
+*.json.gz
+chrome_trace*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# Models / caches (should be on ext4 anyway; belt and braces)
+models/
+.cache/
+
+# OneDrive sync debris
+*~
+.~lock.*
+*conflicted copy*
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
